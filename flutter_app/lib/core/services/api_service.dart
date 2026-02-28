@@ -647,7 +647,7 @@ class UserResponse {
 
 final apiServiceProvider = Provider<ApiService>((ref) {
   final dio = Dio();
-  dio.options.baseUrl = 'http://192.168.157.61:8001';
+  dio.options.baseUrl = 'http://192.168.1.4:8001';
   dio.options.connectTimeout = const Duration(seconds: 30);
   dio.options.receiveTimeout = const Duration(seconds: 30);
 
