@@ -24,17 +24,17 @@ _RIGHT_IRIS = [473, 474, 475, 476, 477]
 _LEFT_EYE_CONTOUR  = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 _RIGHT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
 
-IRIS_SIZE = 64   # normalized iris output size in pixels (square)
+IRIS_SIZE = 200  # normalized iris output size in pixels (square)
 EYE_PAD   = 2.5  # multiplier around iris radius for the crop
 
 
 @dataclass
 class IrisDetectionResult:
-    left_iris:  Optional[np.ndarray]   # grayscale, IRIS_SIZE × IRIS_SIZE
+    left_iris:  Optional[np.ndarray]   # grayscale ROI
     right_iris: Optional[np.ndarray]
     left_center:  Optional[Tuple[int, int]]
     right_center: Optional[Tuple[int, int]]
-    left_radius:  Optional[float]
+    left_radius:  Optional[float]      # Actual iris radius in px
     right_radius: Optional[float]
     landmarks_found: bool
 
@@ -53,16 +53,23 @@ class EyeDetector:
             return
         try:
             import mediapipe as mp
-            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True,
-                max_num_faces=1,
-                refine_landmarks=True,   # enables iris landmarks
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
+            from mediapipe.tasks import python
+            from mediapipe.tasks.python import vision
+            import os
+            
+            model_path = os.path.join(os.path.dirname(__file__), 'face_landmarker.task')
+            base_options = python.BaseOptions(model_asset_path=model_path)
+            options = vision.FaceLandmarkerOptions(
+                base_options=base_options,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+                num_faces=1
             )
-            logger.info("MediaPipe FaceMesh loaded (iris mode).")
-        except ImportError:
-            logger.warning("mediapipe not installed — using Haar fallback.")
+            self._face_mesh = vision.FaceLandmarker.create_from_options(options)
+            self._mp = mp
+            logger.info("MediaPipe FaceLandmarker loaded (iris mode).")
+        except Exception as e:
+            logger.warning(f"mediapipe not installed/working — using Haar fallback. Error: {e}")
             self._face_mesh = None
 
     # ─── Public API ───────────────────────────────
@@ -91,11 +98,13 @@ class EyeDetector:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w = bgr.shape[:2]
 
-        results = self._face_mesh.process(rgb)
-        if not results.multi_face_landmarks:
+        mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
+        detection_result = self._face_mesh.detect(mp_image)
+        
+        if not detection_result.face_landmarks:
             return IrisDetectionResult(None, None, None, None, None, None, False)
 
-        lm = results.multi_face_landmarks[0].landmark
+        lm = detection_result.face_landmarks[0]
 
         def _px(idx):
             p = lm[idx]
@@ -106,24 +115,27 @@ class EyeDetector:
         def _iris_crop(indices):
             cx, cy = _px(indices[0])
             dists = [math.hypot(_px(i)[0]-cx, _px(i)[1]-cy) for i in indices[1:]]
-            radius = max(float(np.mean(dists)), 4.0)
+            radius = float(np.mean(dists)) if dists else 0.0
+            
+            if radius < 5.0:  # Too small to be a reliable iris
+                return None, (cx, cy), radius
 
-            pad = int(radius * EYE_PAD)
-            x1 = max(cx - pad, 0)
-            y1 = max(cy - pad, 0)
-            x2 = min(cx + pad, w)
-            y2 = min(cy + pad, h)
+            # Use larger pad for extracting the ROI (we need the whole iris ring)
+            pad = int(radius * 1.5)
+            x1, y1 = max(cx - pad, 0), max(cy - pad, 0)
+            x2, y2 = min(cx + pad, w), min(cy + pad, h)
 
             if x2 <= x1 or y2 <= y1:
                 return None, (cx, cy), radius
 
             crop = bgr[y1:y2, x1:x2]
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            # Upscale small iris crops (important for zoomed-out shots)
-            gray = cv2.resize(gray, (IRIS_SIZE, IRIS_SIZE), interpolation=cv2.INTER_LANCZOS4)
-            # CLAHE for contrast normalisation (helps vary lighting / distance)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+            
+            # CLAHE for contrast normalization
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
             gray = clahe.apply(gray)
+            
+            # We return the RAW gray crop (not resized) so normalization can use real radii
             return gray, (cx, cy), radius
 
         li, lc, lr = _iris_crop(_LEFT_IRIS)
